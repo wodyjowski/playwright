@@ -15,10 +15,12 @@
  * limitations under the License.
  */
 
-import { ws } from '../utilsBundle';
-import type { WebSocket } from '../utilsBundle';
-import type { Progress } from './progress';
-import { makeWaitForNextTask } from '../utils';
+import { ws } from "../utilsBundle";
+import type { WebSocket } from "../utilsBundle";
+import { getProxyForUrl, HttpsProxyAgent } from "../utilsBundle";
+import * as URL from "url";
+import type { Progress } from "./progress";
+import { makeWaitForNextTask } from "../utils";
 
 export type ProtocolRequest = {
   id: number;
@@ -40,9 +42,9 @@ export type ProtocolResponse = {
 
 export interface ConnectionTransport {
   send(s: ProtocolRequest): void;
-  close(): void;  // Note: calling close is expected to issue onclose at some point.
-  onmessage?: (message: ProtocolResponse) => void,
-  onclose?: () => void,
+  close(): void; // Note: calling close is expected to issue onclose at some point.
+  onmessage?: (message: ProtocolResponse) => void;
+  onclose?: () => void;
 }
 
 export class WebSocketTransport implements ConnectionTransport {
@@ -53,22 +55,31 @@ export class WebSocketTransport implements ConnectionTransport {
   onclose?: () => void;
   readonly wsEndpoint: string;
 
-  static async connect(progress: Progress, url: string, headers?: { [key: string]: string; }, followRedirects?: boolean): Promise<WebSocketTransport> {
+  static async connect(
+    progress: Progress,
+    url: string,
+    headers?: { [key: string]: string },
+    followRedirects?: boolean
+  ): Promise<WebSocketTransport> {
     progress.log(`<ws connecting> ${url}`);
-    const transport = new WebSocketTransport(progress, url, headers, followRedirects);
+    const transport = new WebSocketTransport(
+      progress,
+      url,
+      headers,
+      followRedirects
+    );
     let success = false;
     progress.cleanupWhenAborted(async () => {
-      if (!success)
-        await transport.closeAndWait().catch(e => null);
+      if (!success) await transport.closeAndWait().catch((e) => null);
     });
     await new Promise<WebSocketTransport>((fulfill, reject) => {
-      transport._ws.addEventListener('open', async () => {
+      transport._ws.addEventListener("open", async () => {
         progress.log(`<ws connected> ${url}`);
         fulfill(transport);
       });
-      transport._ws.addEventListener('error', event => {
+      transport._ws.addEventListener("error", (event) => {
         progress.log(`<ws connect error> ${url} ${event.message}`);
-        reject(new Error('WebSocket error: ' + event.message));
+        reject(new Error("WebSocket error: " + event.message));
         transport._ws.close();
       });
     });
@@ -76,8 +87,27 @@ export class WebSocketTransport implements ConnectionTransport {
     return transport;
   }
 
-  constructor(progress: Progress, url: string, headers?: { [key: string]: string; }, followRedirects?: boolean) {
+  constructor(
+    progress: Progress,
+    url: string,
+    headers?: { [key: string]: string },
+    followRedirects?: boolean
+  ) {
     this.wsEndpoint = url;
+
+    const endpointURL = URL.parse(url);
+    const proxyURL =
+      getProxyForUrl(`http://${endpointURL.hostname}`) ||
+      getProxyForUrl(`https://${endpointURL.hostname}`);
+    let agent = undefined;
+    if (proxyURL) {
+      const parsedProxyURL = URL.parse(proxyURL);
+      (parsedProxyURL as any).secureProxy =
+        parsedProxyURL.protocol === `https:`;
+
+      agent = new HttpsProxyAgent(parsedProxyURL);
+    }
+
     this._ws = new ws(url, [], {
       perMessageDeflate: false,
       maxPayload: 256 * 1024 * 1024, // 256Mb,
@@ -85,6 +115,8 @@ export class WebSocketTransport implements ConnectionTransport {
       handshakeTimeout: Math.max(progress.timeUntilDeadline(), 1),
       headers,
       followRedirects,
+      agent: agent,
+      rejectUnauthorized: false,
     });
     this._progress = progress;
     // The 'ws' module in node sometimes sends us multiple messages in a single task.
@@ -93,7 +125,7 @@ export class WebSocketTransport implements ConnectionTransport {
     // to do anything extra.
     const messageWrap: (cb: () => void) => void = makeWaitForNextTask();
 
-    this._ws.addEventListener('message', event => {
+    this._ws.addEventListener("message", (event) => {
       messageWrap(() => {
         try {
           if (this.onmessage)
@@ -104,13 +136,20 @@ export class WebSocketTransport implements ConnectionTransport {
       });
     });
 
-    this._ws.addEventListener('close', event => {
-      this._progress && this._progress.log(`<ws disconnected> ${url} code=${event.code} reason=${event.reason}`);
-      if (this.onclose)
-        this.onclose.call(null);
+    this._ws.addEventListener("close", (event) => {
+      this._progress &&
+        this._progress.log(
+          `<ws disconnected> ${url} code=${event.code} reason=${event.reason}`
+        );
+      if (this.onclose) this.onclose.call(null);
     });
     // Prevent Error: read ECONNRESET.
-    this._ws.addEventListener('error', error => this._progress && this._progress.log(`<ws error> ${error.type} ${error.message}`));
+    this._ws.addEventListener(
+      "error",
+      (error) =>
+        this._progress &&
+        this._progress.log(`<ws error> ${error.type} ${error.message}`)
+    );
   }
 
   send(message: ProtocolRequest) {
@@ -123,9 +162,8 @@ export class WebSocketTransport implements ConnectionTransport {
   }
 
   async closeAndWait() {
-    if (this._ws.readyState === ws.CLOSED)
-      return;
-    const promise = new Promise(f => this._ws.once('close', f));
+    if (this._ws.readyState === ws.CLOSED) return;
+    const promise = new Promise((f) => this._ws.once("close", f));
     this.close();
     await promise; // Make sure to await the actual disconnect.
   }
